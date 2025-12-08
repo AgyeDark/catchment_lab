@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import time # Required for retry logic
 import plotly.graph_objects as go
 
 # --- PAGE CONFIG ---
@@ -26,13 +27,16 @@ class ABCDModel:
         self.gw = initial_gw
 
     def step(self, P, PET):
-        if pd.isna(P): P = 0.0
-        if pd.isna(PET): PET = 5.0
+        # Physics Guardrails
+        if pd.isna(P) or P < 0: P = 0.0
+        if pd.isna(PET) or PET < 0: PET = 3.5 # Fallback to average daily ET
         
         W = P + self.soil
         try:
+            # ABCD Non-linear equation
             inner = ((W + self.b) / (2 * self.a))**2 - (W * self.b / self.a)
-            if inner < 0: inner = 0
+            # Guard against negative square roots (Floating point errors)
+            if inner < 0: inner = 0 
             Y = (W + self.b) / (2 * self.a) - np.sqrt(inner)
         except:
             Y = 0
@@ -71,31 +75,50 @@ class ABCDModel:
             })
         return pd.DataFrame(results)
 
-# --- WEATHER DATA FETCH ---
-@st.cache_data
+# --- WEATHER DATA FETCH (ROBUST) ---
+@st.cache_data(ttl=3600)
 def get_weather_data(lat, lon, past_days):
     if past_days > 92: past_days = 92
     
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=et0_fao_evapotranspiration,precipitation_sum&past_days={past_days}&forecast_days=7&timezone=GMT"
-    try:
-        r = requests.get(url)
-        r.raise_for_status()
-        data = r.json()
-        
-        df = pd.DataFrame({
-            "Date": data['daily']['time'],
-            "ETo": data['daily']['et0_fao_evapotranspiration'],
-            "Rain": data['daily']['precipitation_sum']
-        })
-        
-        df['Date'] = pd.to_datetime(df['Date'])
-        df['ETo'] = pd.to_numeric(df['ETo'], errors='coerce').fillna(0.0)
-        df['Rain'] = pd.to_numeric(df['Rain'], errors='coerce').fillna(0.0)
-        
-        return df
-    except Exception as e:
-        st.error(f"Error fetching data: {e}")
-        return pd.DataFrame()
+    
+    # Retry Logic for Error 429 (Too Many Requests)
+    for attempt in range(3):
+        try:
+            r = requests.get(url)
+            if r.status_code == 429:
+                r.raise_for_status() # Trigger retry
+            
+            r.raise_for_status()
+            data = r.json()
+            
+            df = pd.DataFrame({
+                "Date": data['daily']['time'],
+                "ETo": data['daily']['et0_fao_evapotranspiration'],
+                "Rain": data['daily']['precipitation_sum']
+            })
+            
+            df['Date'] = pd.to_datetime(df['Date'])
+            
+            # --- CURVE BALL FIX 1: INTERPOLATION ---
+            df['ETo'] = pd.to_numeric(df['ETo'], errors='coerce').interpolate().fillna(3.5)
+            df['Rain'] = pd.to_numeric(df['Rain'], errors='coerce').fillna(0.0)
+            
+            return df
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                time.sleep(2 ** attempt) # Wait 1s, 2s, 4s...
+                continue
+            else:
+                st.error(f"API Error: {e}")
+                return pd.DataFrame()
+        except Exception as e:
+            st.error(f"Data Error: {e}")
+            return pd.DataFrame()
+            
+    st.error("Server busy. Please try again later.")
+    return pd.DataFrame()
 
 # --- SIDEBAR: CONTROLS ---
 st.sidebar.header("1. Location & Duration")
@@ -172,17 +195,19 @@ if st.button("Run Simulation", type="primary"):
             st.subheader(f"Combined Hyetograph & Hydrograph ({days_history} Days)")
             fig = go.Figure()
             
+            # Rain (Top, Inverted)
             fig.add_trace(go.Bar(
                 x=df_res['Date'], y=df_res['Rain'], name='Rainfall (Input)',
                 marker_color='blue', opacity=0.3, yaxis='y2'
             ))
             
+            # Flow (Stacked Area)
             fig.add_trace(go.Scatter(
-                x=df_res['Date'], y=df_res['Baseflow'], name='Baseflow (Groundwater)',
+                x=df_res['Date'], y=df_res['Baseflow'], name='Baseflow (GW)',
                 stackgroup='one', fillcolor='rgba(31, 119, 180, 0.5)', line=dict(width=0)
             ))
             fig.add_trace(go.Scatter(
-                x=df_res['Date'], y=df_res['Direct_Runoff'], name='Direct Runoff (Stormflow)',
+                x=df_res['Date'], y=df_res['Direct_Runoff'], name='Direct Runoff (Storm)',
                 stackgroup='one', fillcolor='rgba(255, 127, 14, 0.5)', line=dict(width=0)
             ))
             fig.add_trace(go.Scatter(
@@ -198,27 +223,42 @@ if st.button("Run Simulation", type="primary"):
             )
             st.plotly_chart(fig, use_container_width=True)
             
-            with st.expander("🔎 How to read this Chart"):
+            # --- DETAILED EXPLANATION (Updated) ---
+            with st.expander("🔎 How to read this Chart (Hyetograph vs Hydrograph)"):
                 st.markdown("""
-                **1. The Hyetograph (Top / Blue Bars)**: Represents the **Rainfall**. Taller bars = Heavier storms.
-                **2. The Hydrograph (Bottom / Waves)**: Represents **River Flow**.
-                * **🟠 Direct Runoff:** Flash floods (surface flow).
-                * **🔵 Baseflow:** Groundwater flow (sustains river in dry season).
+                This combined chart visualizes the cause-and-effect relationship in hydrology:
+                
+                **1. The Hyetograph (Top / Blue Bars - Rainfall)**
+                * This represents the **Input** to the catchment.
+                * The bars hang from the top (inverted axis) to simulate rain falling from the sky.
+                * **Interpretation:** Taller blue bars indicate heavier storm events. Gaps indicate dry days.
+                
+                **2. The Hydrograph (Bottom / Waves - River Flow)**
+                * This represents the **Output** or response of the river.
+                * **🟠 Direct Runoff (Orange Area):** This is **Stormflow**. It is water that flows over the land surface immediately after rain. Sharp, high orange peaks suggest a "flashy" catchment (urbanized or degraded soil) causing flash floods.
+                * **🔵 Baseflow (Blue Area):** This is **Groundwater**. It is water that soaked into the soil and is slowly released into the river. A thick, steady blue layer indicates a healthy catchment acting like a sponge, sustaining the river during dry periods.
                 """)
 
             # STATE VARIABLES
             st.subheader("Catchment Storage State")
             fig_state = go.Figure()
-            fig_state.add_trace(go.Scatter(x=df_res['Date'], y=df_res['Soil_Moisture'], name='Soil Moisture'))
-            fig_state.add_trace(go.Scatter(x=df_res['Date'], y=df_res['Aquifer_Storage'], name='Aquifer Storage'))
+            fig_state.add_trace(go.Scatter(x=df_res['Date'], y=df_res['Soil_Moisture'], name='Soil Moisture (Upper Bucket)'))
+            fig_state.add_trace(go.Scatter(x=df_res['Date'], y=df_res['Aquifer_Storage'], name='Aquifer Storage (Lower Bucket)'))
             fig_state.update_layout(yaxis_title="Storage (mm)", hovermode="x unified")
             st.plotly_chart(fig_state, use_container_width=True)
+            
+            with st.expander("🔎 What are these 'Buckets'?"):
+                st.markdown("""
+                The ABCD model treats the ground as two containers:
+                
+                1.  **Soil Moisture (Upper Bucket):** This is the topsoil. It fills up when it rains. If it's full (saturated), any extra rain spills over as **Flood Water**. Deforestation makes this bucket smaller.
+                2.  **Aquifer Storage (Lower Bucket):** This is the deep groundwater. It refills slowly (Recharge) and releases slowly (Baseflow). This is your long-term water savings account.
+                """)
             
             # --- FINAL TOUCH: DOWNLOAD DATA ---
             st.divider()
             st.subheader("📥 Export Results")
             
-            # Convert to CSV
             csv = df_res.to_csv(index=False).encode('utf-8')
             
             st.download_button(
@@ -231,3 +271,7 @@ if st.button("Run Simulation", type="primary"):
             
         else:
             st.error("No weather data found.")
+
+# --- FOOTER (Copyright) ---
+st.divider()
+st.markdown("<p style='text-align: center; color: #888888;'>© 2025 Agyei Darko | Virtual Catchment Laboratory</p>", unsafe_allow_html=True)
